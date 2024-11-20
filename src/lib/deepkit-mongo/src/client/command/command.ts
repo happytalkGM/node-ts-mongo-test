@@ -1,0 +1,172 @@
+/*
+ * Deepkit Framework
+ * Copyright (C) 2021 Deepkit UG, Marc J. Schmidt
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the MIT License.
+ *
+ * You should have received a copy of the MIT License along with this program.
+ */
+
+import { asyncOperation, getClassName } from '@deepkit/core';
+import { handleErrorResponse, MongoDatabaseError, MongoError } from '../error.js';
+import { MongoClientConfig } from '../config.js';
+import { Host } from '../host.js';
+import type { MongoDatabaseTransaction } from '../connection.js';
+import {
+    InlineRuntimeType,
+    ReceiveType,
+    resolveReceiveType,
+    SerializationError,
+    stringifyType,
+    Type,
+    typeOf,
+    typeSettings,
+    UnpopulatedCheck,
+    UUID,
+    ValidationError,
+} from '@deepkit/type';
+import { BSONDeserializer, deserializeBSONWithoutOptimiser, getBSONDeserializer } from '@deepkit/bson';
+import { mongoBinarySerializer } from '../../mongo-serializer.js';
+
+export interface BaseResponse {
+    ok: number;
+    errmsg?: string;
+    code?: number;
+    codeName?: string;
+    writeErrors?: Array<{ index: number, code: number, errmsg: string }>;
+}
+
+export interface TransactionalMessage {
+    lsid?: { id: UUID };
+    txnNumber?: bigint;
+    startTransaction?: boolean;
+    autocommit?: boolean;
+
+    abortTransaction?: 1;
+    commitTransaction?: 1;
+}
+
+export interface ReadPreferenceMessage {
+    $readPreference?: {
+        mode: string;
+        tags?: { [name: string]: string }[];
+        maxStalenessSeconds?: number;
+        hedge?: { enabled: boolean }
+    };
+}
+
+export abstract class Command<T> {
+    protected current?: { responseType?: Type, resolve: Function, reject: Function };
+
+    public sender?: <T>(schema: Type, message: T) => void;
+
+    public sendAndWait<T, R extends BaseResponse = BaseResponse>(
+        message: T, messageType?: ReceiveType<T>, responseType?: ReceiveType<R>,
+    ): Promise<R> {
+        if (!this.sender) throw new Error(`No sender set in command ${getClassName(this)}`);
+        this.sender(resolveReceiveType(messageType), message);
+
+        return asyncOperation((resolve, reject) => {
+            this.current = {
+                resolve,
+                reject,
+                responseType: responseType ? resolveReceiveType(responseType) : typeOf<BaseResponse>(),
+            };
+        });
+    }
+
+    abstract execute(config: MongoClientConfig, host: Host, transaction?: MongoDatabaseTransaction): Promise<T>;
+
+    needsWritableHost(): boolean {
+        return false;
+    }
+
+    handleResponse(response: Uint8Array): void {
+        if (!this.current) throw new Error('Got handleResponse without active command');
+        const deserializer: BSONDeserializer<BaseResponse> = this.current.responseType ? getBSONDeserializer(mongoBinarySerializer, this.current.responseType) : deserializeBSONWithoutOptimiser;
+
+        const oldCheck = typeSettings.unpopulatedCheck;
+        try {
+            typeSettings.unpopulatedCheck = UnpopulatedCheck.None;
+            const message = deserializer(response);
+            const error = handleErrorResponse(message);
+            if (error) {
+                this.current.reject(error);
+                return;
+            }
+
+            if (!message.ok) {
+                this.current.reject(Object.assign(new MongoDatabaseError(message.errmsg || 'error'), { code: message.code }));
+            } else {
+                this.current.resolve(message);
+            }
+        } catch (error: any) {
+            if (error instanceof ValidationError || error instanceof SerializationError) {
+                if (this.current.responseType) {
+                    const raw = deserializeBSONWithoutOptimiser(response);
+                    if (raw.errmsg && raw.ok === 0) {
+                        const error = handleErrorResponse(raw);
+                        if (error) {
+                            this.current.reject(error);
+                            return;
+                        }
+                    }
+
+                    this.current.reject(new MongoError(`Could not deserialize type ${stringifyType(this.current.responseType)}: ${error}`));
+                    return;
+                }
+            }
+            this.current.reject(error);
+        } finally {
+            typeSettings.unpopulatedCheck = oldCheck;
+        }
+    }
+}
+
+interface CommandOptions {
+    // default false
+    needsWritableHost: boolean;
+
+    // default true
+    transactional: boolean;
+
+    // default true
+    readPreference: boolean;
+}
+
+export function createCommand<Request extends {[name: string]: any}, Response>(
+    request: Request | ((config: MongoClientConfig) => Request),
+    optionsIn: Partial<CommandOptions> = {},
+    typeRequest?: ReceiveType<Request>,
+    typeResponse?: ReceiveType<Response>,
+): Command<Response & BaseResponse> {
+    const options: CommandOptions = Object.assign(
+        { needsWritableHost: false, transactional: true, readPreference: true },
+        optionsIn,
+    );
+
+    typeRequest = resolveReceiveType(typeRequest);
+    type FullTypeRequest = InlineRuntimeType<typeof typeRequest> & TransactionalMessage & ReadPreferenceMessage;
+    typeRequest = typeOf<FullTypeRequest>();
+
+    typeResponse = resolveReceiveType(typeResponse);
+    type FullTypeResponse = InlineRuntimeType<typeof typeResponse> & BaseResponse;
+    typeResponse = typeOf<FullTypeResponse>();
+
+    class DynamicCommand extends Command<Response> {
+        async execute(config: MongoClientConfig, host, transaction?): Promise<Response & BaseResponse> {
+            const cmd = 'function' === typeof request ? request(config) : request;
+            if (options.transactional && transaction) transaction.applyTransaction(cmd);
+            if (options.readPreference) config.applyReadPreference(cmd as any);
+            return await this.sendAndWait(cmd, typeRequest, typeResponse as Type) as any;
+        }
+
+        needsWritableHost(): boolean {
+            return options.needsWritableHost;
+        }
+    }
+
+    return new DynamicCommand();
+}
+

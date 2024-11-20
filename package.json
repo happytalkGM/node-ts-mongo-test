@@ -1,0 +1,29 @@
+{
+  "name": "mongo-test-ts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "prebuild": "rimraf dist",
+    "build": "tsc --build",
+    "build:watch": "tsc -w -p .",
+    "clean": "tsc --build --clean",
+    "start:official-driver": "node ./dist/test-official-driver.js",
+    "start:deepkit": "node ./dist/test-deepkit.js",
+    "start:deepkit-initial-pool": "node ./dist/test-deepkit-initial-pool.js",
+    "start:deepkit-custom": "node ./dist/test-deepkit-custom.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@deepkit/mongo": "^1.0.1-alpha.155",
+    "@deepkit/type-compiler": "^1.0.1-alpha.155",
+    "dotenv": "^16.4.5",
+    "mongodb": "^6.10.0",
+    "rimraf": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.6"
+  }
+}
