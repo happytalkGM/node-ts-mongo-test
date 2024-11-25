@@ -20,7 +20,7 @@
     "@deepkit/mongo": "^1.0.1-alpha.155",
     "@deepkit/type-compiler": "^1.0.1-alpha.155",
     "dotenv": "^16.4.5",
-    "mongodb": "^6.10.0",
+    "mongodb": "^6.11.0",
     "rimraf": "^6.0.1"
   },
   "devDependencies": {
